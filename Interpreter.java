@@ -51,6 +51,7 @@ public class Interpreter {
         env.define("Boolean",   "<<Boolean>>");
         env.define("Array",     "<<Array>>");
         env.define("Object",    "<<Object>>");
+        env.define("Date",      "<<Date>>");
         env.define("parseInt",  "<<parseInt>>");
         env.define("parseFloat","<<parseFloat>>");
         env.define("isNaN",     "<<isNaN>>");
@@ -74,6 +75,33 @@ public class Interpreter {
         if (node instanceof VarDeclNode n) {
             Object value = n.initializer != null ? evalExpr(n.initializer, env) : null;
             env.define(n.name, value);
+
+        } else if (node instanceof MultiVarDeclNode n) {
+            for (Node decl : n.decls) evalStatement(decl, env);
+
+        } else if (node instanceof ArrayDestructureDeclNode n) {
+            Object source = evalExpr(n.initializer, env);
+            List<Object> elems = (source instanceof JSArray arr) ? arr.elements : new ArrayList<>();
+            for (int i = 0; i < n.names.size(); i++) {
+                String name = n.names.get(i);
+                if (name == null) continue; // skipped slot, e.g. [, , third]
+                if (n.isRest.get(i)) {
+                    // Rest element collects all remaining values into a new array
+                    List<Object> rest = i < elems.size()
+                            ? new ArrayList<>(elems.subList(i, elems.size()))
+                            : new ArrayList<>();
+                    env.define(name, new JSArray(rest));
+                } else {
+                    env.define(name, i < elems.size() ? elems.get(i) : null);
+                }
+            }
+
+        } else if (node instanceof ObjectDestructureDeclNode n) {
+            Object source = evalExpr(n.initializer, env);
+            for (int i = 0; i < n.keys.size(); i++) {
+                Object val = getMember(source, n.keys.get(i));
+                env.define(n.names.get(i), val);
+            }
 
         } else if (node instanceof BlockNode n) {
             Environment blockEnv = new Environment(env);
@@ -276,6 +304,24 @@ public class Interpreter {
 
     private Object evalAssignment(AssignmentNode n, Environment env) {
         Object value = evalExpr(n.value, env);
+
+        // Array destructuring assignment: [a, b] = [b, a]
+        if (n.target instanceof ArrayLiteralNode al && n.op.equals("=")) {
+            List<Object> elems = (value instanceof JSArray arr) ? arr.elements : new ArrayList<>();
+            for (int i = 0; i < al.elements.size(); i++) {
+                Node target = al.elements.get(i);
+                if (target instanceof SpreadNode s) {
+                    List<Object> rest = i < elems.size()
+                            ? new ArrayList<>(elems.subList(i, elems.size()))
+                            : new ArrayList<>();
+                    setVar(s.expression, new JSArray(rest), env);
+                } else {
+                    Object v = i < elems.size() ? elems.get(i) : null;
+                    setVar(target, v, env);
+                }
+            }
+            return value;
+        }
 
         if (n.target instanceof IdentifierNode id) {
             Object result = applyAssignOp(n.op, env.has(id.name) ? env.get(id.name) : null, value);
@@ -540,6 +586,7 @@ public class Interpreter {
         if (obj instanceof JSArray arr) return callArrayMethod(arr, method, args, env);
         if (obj instanceof String str)  return callStringMethod(str, method, args);
         if (obj instanceof Double d)    return callNumberMethod(d, method, args);
+        if (isDate(obj)) return callDateMethod((JSObject) obj, method, args);
         if (obj instanceof JSObject jsObj) {
             Object fn = jsObj.props.get(method);
             if (fn instanceof JSFunction) return callFunction(fn, args, env);
@@ -803,24 +850,131 @@ public class Interpreter {
         };
     }
 
+    // ── Date helpers ──────────────────────────────────────────────────────────
+
+    private JSObject makeDate(List<Object> args) {
+        java.util.Calendar cal;
+        if (args.isEmpty()) {
+            cal = java.util.Calendar.getInstance();
+        } else if (args.size() == 1 && args.get(0) instanceof String s) {
+            cal = java.util.Calendar.getInstance();
+            java.util.Date parsed = parseDateString(s);
+            cal.setTime(parsed);
+        } else if (args.size() == 1) {
+            cal = java.util.Calendar.getInstance();
+            cal.setTimeInMillis((long) toNumber(args.get(0)));
+        } else {
+            // new Date(year, month, day, hours, minutes, seconds)
+            cal = java.util.Calendar.getInstance();
+            cal.clear();
+            int year   = (int) toNumber(args.get(0));
+            int month  = args.size() > 1 ? (int) toNumber(args.get(1)) : 0;
+            int day    = args.size() > 2 ? (int) toNumber(args.get(2)) : 1;
+            int hour   = args.size() > 3 ? (int) toNumber(args.get(3)) : 0;
+            int minute = args.size() > 4 ? (int) toNumber(args.get(4)) : 0;
+            int second = args.size() > 5 ? (int) toNumber(args.get(5)) : 0;
+            cal.set(year, month, day, hour, minute, second);
+        }
+        JSObject date = new JSObject();
+        date.set("__calendar__", cal);
+        return date;
+    }
+
+    private java.util.Date parseDateString(String s) {
+        s = s.trim();
+        String[] formats = {
+            "yyyy-MM-dd'T'HH:mm:ss",
+            "yyyy-MM-dd",
+            "yyyy/MM/dd",
+            "MM/dd/yyyy",
+            "EEE MMM dd yyyy HH:mm:ss"
+        };
+        for (String fmt : formats) {
+            try {
+                java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat(fmt);
+                sdf.setLenient(false);
+                return sdf.parse(s);
+            } catch (java.text.ParseException ignored) {}
+        }
+        // Fallback: try generic Date parsing
+        try { return new java.util.Date(s); } catch (Exception e) { return new java.util.Date(); }
+    }
+
+    private boolean isDate(Object obj) {
+        return obj instanceof JSObject jo && jo.props.containsKey("__calendar__");
+    }
+
+    private java.util.Calendar getCal(JSObject date) {
+        return (java.util.Calendar) date.props.get("__calendar__");
+    }
+
+    private static final String[] WEEKDAY_NAMES = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    private static final String[] MONTH_NAMES   = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+
+    private Object callDateMethod(JSObject date, String method, List<Object> args) {
+        java.util.Calendar cal = getCal(date);
+        return switch (method) {
+            case "getFullYear"  -> (double) cal.get(java.util.Calendar.YEAR);
+            case "getMonth"     -> (double) cal.get(java.util.Calendar.MONTH); // 0-based
+            case "getDate"      -> (double) cal.get(java.util.Calendar.DAY_OF_MONTH);
+            case "getDay"       -> (double) (cal.get(java.util.Calendar.DAY_OF_WEEK) - 1); // 0 = Sunday
+            case "getHours"     -> (double) cal.get(java.util.Calendar.HOUR_OF_DAY);
+            case "getMinutes"   -> (double) cal.get(java.util.Calendar.MINUTE);
+            case "getSeconds"   -> (double) cal.get(java.util.Calendar.SECOND);
+            case "getMilliseconds" -> (double) cal.get(java.util.Calendar.MILLISECOND);
+            case "getTime"      -> (double) cal.getTimeInMillis();
+            case "getTimezoneOffset" -> (double) (-cal.get(java.util.Calendar.ZONE_OFFSET) / 60000);
+
+            case "setFullYear"  -> { cal.set(java.util.Calendar.YEAR, (int) toNumber(args.get(0))); yield (double) cal.getTimeInMillis(); }
+            case "setMonth"     -> { cal.set(java.util.Calendar.MONTH, (int) toNumber(args.get(0))); yield (double) cal.getTimeInMillis(); }
+            case "setDate"      -> { cal.set(java.util.Calendar.DAY_OF_MONTH, (int) toNumber(args.get(0))); yield (double) cal.getTimeInMillis(); }
+            case "setHours"     -> { cal.set(java.util.Calendar.HOUR_OF_DAY, (int) toNumber(args.get(0))); yield (double) cal.getTimeInMillis(); }
+            case "setMinutes"   -> { cal.set(java.util.Calendar.MINUTE, (int) toNumber(args.get(0))); yield (double) cal.getTimeInMillis(); }
+            case "setSeconds"   -> { cal.set(java.util.Calendar.SECOND, (int) toNumber(args.get(0))); yield (double) cal.getTimeInMillis(); }
+            case "setTime"      -> { cal.setTimeInMillis((long) toNumber(args.get(0))); yield (double) cal.getTimeInMillis(); }
+
+            case "toString", "toDateString" -> dateToString(cal, method);
+            case "toTimeString" -> String.format("%02d:%02d:%02d GMT", cal.get(java.util.Calendar.HOUR_OF_DAY),
+                    cal.get(java.util.Calendar.MINUTE), cal.get(java.util.Calendar.SECOND));
+            case "toISOString" -> {
+                java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+                sdf.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+                yield sdf.format(cal.getTime());
+            }
+            case "valueOf" -> (double) cal.getTimeInMillis();
+            default -> throw new RuntimeException("Date." + method + " not implemented");
+        };
+    }
+
+    private String dateToString(java.util.Calendar cal, String method) {
+        String day   = WEEKDAY_NAMES[cal.get(java.util.Calendar.DAY_OF_WEEK) - 1];
+        String month = MONTH_NAMES[cal.get(java.util.Calendar.MONTH)];
+        int date     = cal.get(java.util.Calendar.DAY_OF_MONTH);
+        int year     = cal.get(java.util.Calendar.YEAR);
+        if (method.equals("toDateString")) {
+            return String.format("%s %s %02d %d", day, month, date, year);
+        }
+        // full toString
+        return String.format("%s %s %02d %d %02d:%02d:%02d GMT", day, month, date, year,
+                cal.get(java.util.Calendar.HOUR_OF_DAY), cal.get(java.util.Calendar.MINUTE), cal.get(java.util.Calendar.SECOND));
+    }
+
     // ── new keyword ───────────────────────────────────────────────────────────
 
     private Object evalNew(NewNode n, Environment env) {
-        Object callee = evalExpr(n.callee, env);
         List<Object> args = evalArgs(n.args, env);
 
-        // new Date()
-        if (n.callee instanceof IdentifierNode id && id.name.equals("Date")) {
-            JSObject date = new JSObject();
-            java.util.Date d = args.isEmpty() ? new java.util.Date() : new java.util.Date((long) toNumber(args.get(0)));
-            date.set("__date__", d);
-            return date;
+        // new Date(...) — handle before evaluating callee (Date isn't a real function)
+        if (n.callee instanceof IdentifierNode id0 && id0.name.equals("Date")) {
+            return makeDate(args);
         }
 
         // new Array(n) or new Array(a, b, ...)
-        if (n.callee instanceof IdentifierNode id && id.name.equals("Array")) {
+        if (n.callee instanceof IdentifierNode id1 && id1.name.equals("Array")) {
             return callGlobal("Array", args, env);
         }
+
+        Object callee = evalExpr(n.callee, env);
 
         // User-defined constructor
         if (callee instanceof JSFunction fn) {
@@ -904,6 +1058,9 @@ public class Interpreter {
             try { return Double.parseDouble(s); }
             catch (NumberFormatException e) { return Double.NaN; }
         }
+        if (val instanceof JSObject jo && jo.props.containsKey("__calendar__")) {
+            return (double) ((java.util.Calendar) jo.props.get("__calendar__")).getTimeInMillis();
+        }
         return Double.NaN;
     }
 
@@ -918,9 +1075,26 @@ public class Interpreter {
         }
         if (val instanceof String s) return s;
         if (val instanceof JSArray arr) return arr.toString();
-        if (val instanceof JSObject obj) return "[object Object]";
+        if (val instanceof JSObject obj) {
+            if (obj.props.containsKey("__calendar__")) {
+                return dateToStringStatic((java.util.Calendar) obj.props.get("__calendar__"));
+            }
+            return "[object Object]";
+        }
         if (val instanceof JSFunction fn) return fn.toString();
         return val.toString();
+    }
+
+    // Static version of full Date.toString() used by jsToString (no instance access needed)
+    private static String dateToStringStatic(java.util.Calendar cal) {
+        String[] weekdays = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+        String[] months   = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+        String day   = weekdays[cal.get(java.util.Calendar.DAY_OF_WEEK) - 1];
+        String month = months[cal.get(java.util.Calendar.MONTH)];
+        int date     = cal.get(java.util.Calendar.DAY_OF_MONTH);
+        int year     = cal.get(java.util.Calendar.YEAR);
+        return String.format("%s %s %02d %d %02d:%02d:%02d GMT", day, month, date, year,
+                cal.get(java.util.Calendar.HOUR_OF_DAY), cal.get(java.util.Calendar.MINUTE), cal.get(java.util.Calendar.SECOND));
     }
 
     // Display string for console.log (booleans/null show as-is, not quoted)

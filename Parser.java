@@ -72,6 +72,54 @@ public class Parser {
 
     private Node parseVarDecl() {
         consume(); // let / const / var
+
+        // Array destructuring: const [a, b, ...rest] = expr;
+        if (check(TokenType.LBRACKET)) {
+            consume();
+            List<String> names = new ArrayList<>();
+            List<Boolean> isRest = new ArrayList<>();
+            while (!check(TokenType.RBRACKET)) {
+                boolean rest = match(TokenType.DOT_DOT_DOT);
+                // Allow skipping elements with empty slots: [, , third]
+                if (check(TokenType.COMMA) || check(TokenType.RBRACKET)) {
+                    names.add(null);
+                    isRest.add(false);
+                } else {
+                    names.add(expect(TokenType.IDENTIFIER).value);
+                    isRest.add(rest);
+                }
+                if (!check(TokenType.RBRACKET)) expect(TokenType.COMMA);
+            }
+            expect(TokenType.RBRACKET);
+            expect(TokenType.ASSIGN);
+            Node init = parseExpression();
+            skipSemicolons();
+            return new ArrayDestructureDeclNode(names, isRest, init);
+        }
+
+        // Object destructuring: const { a, b: renamed } = expr;
+        if (check(TokenType.LBRACE)) {
+            consume();
+            List<String> keys = new ArrayList<>();
+            List<String> names = new ArrayList<>();
+            while (!check(TokenType.RBRACE)) {
+                String key = expect(TokenType.IDENTIFIER).value;
+                String name = key;
+                if (match(TokenType.COLON)) {
+                    name = expect(TokenType.IDENTIFIER).value;
+                }
+                keys.add(key);
+                names.add(name);
+                if (!check(TokenType.RBRACE)) expect(TokenType.COMMA);
+            }
+            expect(TokenType.RBRACE);
+            expect(TokenType.ASSIGN);
+            Node init = parseExpression();
+            skipSemicolons();
+            return new ObjectDestructureDeclNode(keys, names, init);
+        }
+
+        // Normal: let x = ..., y = ...;
         List<Node> decls = new ArrayList<>();
         do {
             String name = expect(TokenType.IDENTIFIER).value;
@@ -82,7 +130,7 @@ public class Parser {
             decls.add(new VarDeclNode(name, init));
         } while (match(TokenType.COMMA));
         skipSemicolons();
-        return decls.size() == 1 ? decls.get(0) : new BlockNode(decls);
+        return decls.size() == 1 ? decls.get(0) : new MultiVarDeclNode(decls);
     }
 
     private Node parseIf() {
@@ -506,7 +554,10 @@ public class Parser {
 
             case NEW -> {
                 consume();
-                Node callee = parseCallAndAccess();
+                // Parse the constructor target WITHOUT consuming call-parens
+                // (e.g. "Date" or "foo.Bar"), so the following "(...)" is
+                // treated as the constructor's argument list, not a call.
+                Node callee = parseNewTarget();
                 List<Node> args = new ArrayList<>();
                 if (check(TokenType.LPAREN)) {
                     consume();
@@ -523,6 +574,17 @@ public class Parser {
 
             default -> throw new RuntimeException("Unexpected token in expression: " + t.type + " ('" + t.value + "')");
         }
+    }
+
+    // Parse a constructor target for `new X` / `new X.Y.Z` without consuming `(...)`.
+    private Node parseNewTarget() {
+        Node node = parsePrimary();
+        while (check(TokenType.DOT)) {
+            consume();
+            String prop = expect(TokenType.IDENTIFIER).value;
+            node = new MemberAccessNode(node, prop);
+        }
+        return node;
     }
 
     // ── Arrow function helpers ────────────────────────────────────────────────

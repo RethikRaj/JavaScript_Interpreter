@@ -19,9 +19,42 @@ class VarDeclNode extends Node {
     }
 }
 
+// Array destructuring declaration: const [a, b, ...rest] = expr;
+// Each target name corresponds by position; if isRest[i] is true, that
+// element collects all remaining elements into an array (must be last).
+class ArrayDestructureDeclNode extends Node {
+    public final List<String> names;
+    public final List<Boolean> isRest;
+    public final Node initializer;
+    public ArrayDestructureDeclNode(List<String> names, List<Boolean> isRest, Node initializer) {
+        this.names = names;
+        this.isRest = isRest;
+        this.initializer = initializer;
+    }
+}
+
+// Object destructuring declaration: const { a, b: renamed } = expr;
+class ObjectDestructureDeclNode extends Node {
+    public final List<String> keys;   // source property name
+    public final List<String> names;  // local variable name (may equal key)
+    public final Node initializer;
+    public ObjectDestructureDeclNode(List<String> keys, List<String> names, Node initializer) {
+        this.keys = keys;
+        this.names = names;
+        this.initializer = initializer;
+    }
+}
+
 class BlockNode extends Node {
     public final List<Node> statements;
     public BlockNode(List<Node> statements) { this.statements = statements; }
+}
+
+// Multiple declarations in one statement: let a = 1, b = 2;
+// Unlike BlockNode, these are declared directly in the current scope.
+class MultiVarDeclNode extends Node {
+    public final List<Node> decls; // each a VarDeclNode
+    public MultiVarDeclNode(List<Node> decls) { this.decls = decls; }
 }
 
 class IfNode extends Node {
