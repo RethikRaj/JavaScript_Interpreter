@@ -27,7 +27,7 @@ cd JavaScript_Interpreter
 javac TokenType.java Token.java Node.java Lexer.java Parser.java Environment.java JSFunction.java JSArray.java JSObject.java Interpreter.java Main.java
 ```
 
-### 3. Run a JavaScript file
+### 3. Run a Java file
 
 ```bash
 java Main <path-to-file.js>
